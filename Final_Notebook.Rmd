@@ -1,0 +1,478 @@
+---
+title: "Predicting football match probabilities combining Linear Regression and Scoring Intensity"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Outline
+
+    1. Introduction
+
+    2. The Data
+
+    3. The models
+
+      i) Non-Hierarchical
+
+        	a. Prior Choices
+        	b. Stan code
+        	c. R-hat Convergence diagnosis
+        	d. HMC specific convergence diagnostics
+        	e. Effective sample size diagnostic (ESS)
+        	f. Posterior Predictive Checking
+
+
+      ii) Hierarchical
+
+        	a. Prior Choices
+        	b. Stan code
+        	c. R-hat Convergence diagnosis
+        	d. HMC specific convergence diagnostics
+        	e. Effective sample size diagnostic (ESS)
+        	f. Posterior Predictive Checking
+
+    4. Comparison of the models
+
+    5. Conclusion and discussion of problems and potential improvements
+
+    6. Conclusion
+
+```{r setup, include=FALSE}
+library(reticulate)
+library(jsonlite)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
+library(rstan)
+library(rstanarm)
+library(ggplot2)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+SEED <- 48927 # set random seed for reproducability
+```  
+
+```{r data_gathering, include = FALSE}
+json_file <- 'https://datahub.io/sports-data/english-premier-league/datapackage.json'
+json_data <- fromJSON(paste(readLines(json_file), collapse=""))
+path_to_file <- json_data$resources$path[2]
+season_1819 <- read.csv(url(path_to_file))
+```
+
+```{r functions for betting odds , include = FALSE}
+bettors = c("B365", "BW", "IW", "PS", "WH", "VC")
+
+default_dataframe = season_1819
+
+getNames = function(bettor){
+  return (c(paste(bettor,"H",sep=""),paste(bettor,"D",sep=""),paste(bettor,"A",sep="")))
+}
+
+getAllBettingOdds = function(bettor, dataframe=default_dataframe){
+  return (dataframe[getNames(bettor)])
+}
+
+getAllInverseBettingOdds = function(bettor, dataframe=default_dataframe){
+  return (1/getAllBettingOdds(bettor, dataframe))
+}
+
+getInverseBettingOdds = function(bettor, match, dataframe=default_dataframe){
+  return (getAllInverseBettingOdds(bettor, dataframe)[match,])
+}
+
+getBooksum = function(bettor, match, dataframe=default_dataframe){
+  return (sum(getInverseBettingOdds(bettor,match)))
+}
+
+calculateBooksum = function(inverseBettingOdds){
+  return (sum(inverseBettingOdds))
+}
+
+calculateBasicProbabilities = function(inverseBettingOdds, dataframe=default_dataframe){
+  result = c()
+  booksum = calculateBooksum(inverseBettingOdds)
+  for (i in inverseBettingOdds){
+    result = c(result, i/(booksum))
+  }
+  return (result)
+}
+
+getBasicProbabilities = function(bettor, match, dataframe=default_dataframe){
+  inverseBettingOdds = getInverseBettingOdds(bettor, match, dataframe)
+  probabilities = calculateBasicProbabilities(inverseBettingOdds, dataframe)
+  return (data.frame(
+    "win" = probabilities[1], "draw" = probabilities[2], "loss" = probabilities[3]))
+}
+
+```
+
+## 1. Introduction
+
+When we began the task of predicting football scores, we thought about the possibility of beating the bookmakers. In a sense that maybe, with all the knowledge we're learning here, we could, eventually, make more accurate predictions than them. However, after further investigation of different procedures, we learnt that the most reliable ones actually uses the data from the bookmakers to try to beat them. This sounded a bit counter-intuitive at the beginning, as we would be using the same information to beat their result. But since they are the most accurate yet indirect source of information about the outcome of a match, refining them with a model would be a very interesting idea.
+
+However, in this case we didn't go that far. Instead, we focused on building two accurate models that could be improved later by adding the betting odds, but we will still use them as a reference and a comparison tool.
+
+About the models we're building, we chose to make a non-hierarchical and a hierarchical model. They rely completely on the number of goals for each team. This is because, as we've learned with the reseach on the field, this numbers follow two independent Poisson distribution one for the home team and another for the visitor team. And with them we can infer the goal diference in the match, rattings for each team's score intensity and finally, probabilities for the outcomes of the matches.
+
+As for the outline of the document, in the next section we will talk about the data, how we retrieved and analized it.
+
+In section 3, we'll explain both models, along with a convergence analysis and posterior predictive checking. We will also compare their accuracy, to test which model is better.
+
+In section 4, we will make a conclussion of the project and discuss in which ways it could be improved.
+
+## 2. Analysis of the data
+
+The data we're using for this project is from an open repository, called football-data.co.uk. From this repository we can retrieve data of different leagues and seasons. And for each season, there is sensible information for every match played.
+
+The information given for every match are the number of corners, offsides, faults, goals, shots, etc. for both of the teams. This is the direct information or objective information of the game. There is also the indirect information, as betting odds from different betting houses, for each of the possible outcomes.
+
+For example, this the first match in our dataset, for the season 18-19 of the Premier League:
+
+```{r data_example, echo=FALSE}
+season_1819[1,]
+```
+
+As we can see, there is 63 features. And the betting odds for the betting hose "B365" are:
+
+House Win: 1.57
+Draw: 3.9
+House Loss: 7.5
+
+It shows that the higher reward is given when betting on Leicester (visitor team), over Man United (home team). With a simple transformation, we can calculate the probabilities, using the formula $Probability_i = \frac{BettingOdd_i}{ \sum_iBettingOdd_i}$
+
+And so, the probabilities for this match according to the B365 beting odds are:
+
+
+```{r probabilities_example, echo = FALSE}
+getBasicProbabilities("B365",1)
+
+```
+
+However, from all this data we're mostly interested on the teams that played the match, and the number of goals they scored.
+
+```{r}
+football = season_1819[c("HomeTeam","AwayTeam","FTHG","FTAG")]
+head(football)
+```
+
+Let's plot now the frecuency of number of goals, to see how its distribution assimilates to a Poisson distribution.
+
+
+```{r}
+
+poisson_mean =  1.4
+
+poisson_values =  rpois(380, poisson_mean)
+
+ggplot(football, aes(x = FTHG, fill="FTHG") ,alpha = 0.2) +
+  geom_histogram(binwidth = 0.5)+  xlim(-0.3,6.5) + geom_histogram(aes(x = poisson_values, fill="Poisson(1.4)"), alpha = 0.2, binwidth = 0.5) #+ geom_bar(aes(fill = c("grey")))
+
+
+```
+
+
+## 3. The bayesian models
+
+### i) Non-Hierarchical model
+
+The four steps of a Bayesian analysis are
+
+1. Specify a joint distribution for the outcome(s) and all the unknowns, which typically takes the form of a marginal prior distribution for the unknowns multiplied by a likelihood for the outcome(s) conditional on the unknowns. This joint distribution is proportional to a posterior distribution of the unknowns conditional on the observed data
+2. Draw from posterior distribution using Markov Chain Monte Carlo (MCMC).
+3. Evaluate how well the model fits the data and possibly revise the model.
+4. Draw from the posterior predictive distribution of the outcome(s) given interesting values of the predictors in order to visualize how a manipulation of a predictor affects (a function of) the outcome(s).
+
+#### a. Prior Choices
+
+Weakly informative prior is chosen for the model. The goal here is to specify a prior that captures ignorance about the parameter value. A weakly informative prior has the following general benefits:
+* It represents genuine prior ignorance: A weakly informative prior will gives a reasonable representation of genuine ignorance about the parameter
+* It does not contribute strongly to the posterior: The prior and likelihood functions both contribute to the posterior. There are various techniques to measure the contribution of each of these functions
+* It allows us to make objective inferences: In objective Bayesian analysis we formulate a method of prior selection that leads to a unique prior (i.e., it does not have variable hyperparameters). Virtually every approach to objective Bayesian analysis formulates the prior based on some argument to ignorance, yielding a weakly informative prior.
+
+```{r}
+data_train <- apply(football,1, function(row){
+  data.frame(team = c(row['HomeTeam'],row['AwayTeam']),
+             opponent=c(row['AwayTeam'],row['HomeTeam']),
+             goals= c(row['FTHG'],row['FTAG']),
+             home=c(1,0))
+})
+data_train <- do.call(rbind,data_train)
+data_train$goals <- as.numeric(data_train$goals)
+```
+
+```{r}
+# Estimate Bayesian version with weakly informative prior
+stan_glm1 <- stan_glm(goals ~ home + team + opponent,
+                      data = data_train, family = poisson(link = "log"),
+                      prior = normal(0, 1, autoscale=FALSE),
+                      seed = 12345, control = list(adapt_delta = 0.8))
+prior_summary(stan_glm1)
+```
+
+
+
+#### b. Stan code
+
+log(L) = mu + home + team(i) + opponent(j)
+
+The mu is the overall mean number of goals. The home is the effect on number of goals a team has by playing at home. Team(i) is the effect of team number i, opponent(j) is the effect of team j.
+
+The logarithm on the left hand side is called the link function. In this case it ensures us that we never get negative expected number of goals.
+
+
+```{r}
+summary(stan_glm1)
+```
+
+#### c. R-hat Convergence diagnosis
+```{r}
+summary(stan_glm1)[, "Rhat"]
+```
+The Rhat resutls show R-hat convergence diagnostic, which compares the between- and within-chain estimates for model parameters and other univariate quantities of interest. If chains have not mixed well (ie, the between- and within-chain estimates don't agree), R-hat is larger than 1. In this case, all the variables have R-hat = 1. The chains converged.
+
+#### d. HMC specific convergence diagnostics
+
+* Divergences
+rstanarm will print a warning if there are any divergent transitions after the warmup period, in which case the posterior sample may be biased. The recommended method is to increase the adapt_delta parameter – target average proposal acceptance probability in the adaptation – which will in turn reduce the step size. Each of the modeling functions accepts an adapt_delta argument, so to increase adapt_delta you can simply change the value from the default value to a value closer to 1. Adapt_delta is 0.8 for the model and no warning appeared.
+
+* Treedepth
+
+Warnings about hitting the maximum treedepth are not as serious as warnings about divergent transitions. While divergent transitions are a validity concern, hitting the maximum treedepth is an efficiency concern. When the maximum allowed tree depth is reached it indicates that NUTS is terminating prematurely to avoid excessively long execution time.
+
+The default max tree depth is in this model is 10.
+
+#### e. Effective sample size diagnostic (ESS)
+
+The effective sample size (ESS) of a quantity of interest captures how many independent draws contain the same amount of information as the dependent sample obtained by the MCMC algorithm. Clearly, the higher the ESS the better.
+
+```{r}
+summary(stan_glm1)[, "n_eff"]
+```
+
+
+#### f. Posterior Predictive Checking
+
+The plot is to compare the probability to score certain goals for each Chelsea and Arsenal when Chelsea plays on its home field.
+
+```{r}
+predictHome <- mean(posterior_predict(stan_glm1, data.frame(home=1, team="Chelsea", opponent="Arsenal"), type="response"))
+predictAway <- mean(posterior_predict(stan_glm1, data.frame(home=0, team="Arsenal", opponent = "Chelsea"), type="response"))
+
+#plot the poisson distributions
+plotrange <- 0:6
+hp <- dpois(plotrange, predictHome)
+ap <- dpois(plotrange, predictAway)
+plot(plotrange, hp, col="red", type="b", ylim=range(hp, ap), main="Goals, Chelsea vs Arsenal", xlab="Number of goals", ylab="Probability")
+points(plotrange, ap, type="b", pch=24)
+legend(x=4, y=0.4, legend=c("Chelsea", "Arsenal"), pch=c(21, 24))
+```
+
+
+Similarly, we can predict the goals each team scores each match. If we simulate posterior predict result 10000 times, we can find the prediction for win, draw and loss rate for each match.
+
+```{r}
+footballpredict <- function(Home, Away) {
+  predictHome <- mean(posterior_predict(stan_glm1, data.frame(home=1, team= Home, opponent= Away), type="response"))
+  predictAway <- mean(posterior_predict(stan_glm1, data.frame(home=0, team= Away, opponent= Home ), type="response"))
+  set.seed(915706074)
+  nsim <- 10000 #number of simulation
+  homeGoalsSim <- rpois(nsim, predictHome)
+  awayGoalsSim <- rpois(nsim, predictAway)
+  goalDiffSim <- homeGoalsSim - awayGoalsSim
+  results = data.frame(Home= Home, Away= Away, Win = sum(goalDiffSim > 0) / nsim, Draw =  sum(goalDiffSim == 0) / nsim,
+                       Loss = sum(goalDiffSim < 0) / nsim)
+  return(results)
+}
+prediction_non_hier = apply(football,1, function(row){data.frame(footballpredict(row['HomeTeam'], row['AwayTeam']))})
+do.call(rbind,prediction_non_hier)
+```
+
+Posterior predictive checks can let us inspect what the model suggests for our target variable vs. what actually is the case. So, we use posterior predictive to "look for systematic discrepancies between real and simulated data".
+
+```{r}
+pp_check(stan_glm1)
+```
+
+
+### ii) Hierarchical model
+
+The idea of this model is to assign a "prowess" score to each team. The associated Stan model lies in football-scores.stan.
+We assume that each team scores goals according to independent Poisson distributions and score difference is given by a Skellam distribution (difference between independent Poisson random variables).
+
+In formulas, here is how the model is built:
+
+$$
+\begin{aligned}
+\sigma_i &\sim \text{Inverse-}\Gamma(1,1)\\
+\lambda_i &\sim \text{Log-Normal}(\mu_{\text{prior}_i}, \sigma^2_i)\\
+y &\sim \text{Skellam}(\lambda_{\text{Home team}},\lambda_{\text{Away team}})
+\end{aligned}
+$$
+
+#### a. Prior Choices
+
+Assign prior medians to top, medium and other teams.
+
+```{r data_load_hierarchical , include=FALSE}
+footballdobule <- rbind(football,football) # we double the input to match the number of points of the other model
+
+y_ <- footballdobule$FTHG - football$FTAG 
+N_ <- length(y_)
+teams_ = unique(footballdobule$HomeTeam)
+team1_ <- match(footballdobule$HomeTeam, teams_)
+team2_ <- match(footballdobule$AwayTeam, teams_)
+Nteams_ <- length(teams_)
+```
+```{r priors_hierarchical}
+prior_mu = rep(0, length(teams_))
+top_teams <- c('Arsenal', 'Chelsea', 'Man United', 'Liverpool', 'Man City', 'Tottenham')
+med_teams <- c('Everton', 'Southampton', 'Leicester')
+prior_mu[match(top_teams, teams_)] <- log(1.5)
+prior_mu[match(med_teams, teams_)] <- log(1.3)
+```
+```{r data_list_hierarchical , include=FALSE}
+#Create a list with data
+
+d_lin <-list(y = y_,
+             N = N_,
+             teams = teams_,
+             team1 = team1_,
+             team2 = team2_,
+             Nteams = Nteams_,
+             prior_mu = prior_mu)
+
+```
+#### b. Stan code
+
+```{r stan_model_hierarchical}
+writeLines(readLines("football-scores.stan"))
+```
+
+#### c. R-hat Convergence diagnosis
+
+We use the Rhat function from rstan package.
+
+```{r stan_fit_hierarchical}
+fit_foot <- stan(file = 'football-scores.stan', data = d_lin, seed = SEED)
+```
+```{r monitor_hierarchical}
+monitor_hierarchical = monitor(fit_foot, probs = c(0.1, 0.5, .9))
+```
+
+```{r plot_hierachical}
+posterior_draws <- fit_foot %>%
+  extract %>%
+  as.data.frame() %>% 
+  #as_tibble() %>% 
+  dplyr::select(starts_with('lambda')) %>% 
+  gather(param, draw, everything()) %>% 
+  mutate(param = str_replace_all(param, '[^0-9]', '') %>% as.integer())
+posterior_draws %>% 
+  group_by(param) %>% 
+  summarise(median = median(draw), up = quantile(draw, .95), down = quantile(draw, .05)) %>% 
+  mutate(team = teams_) %>% 
+  ggplot(aes(reorder(team, median), median)) +
+  geom_errorbar(aes(ymin = down, ymax = up)) +
+  geom_point() +
+  coord_flip() +
+  labs(
+    title = 'Season 18/19 Premier League - Team Scoring Intensity',
+    subtitle = 'Median and 95% credible interval',
+    y = 'Scoring Intensity',
+    x = ''
+  )
+
+```
+
+#### d. HMC specific convergence diagnostics
+
+#### e. Effective sample size diagnostic (ESS)
+```{r eff_diagnosis_hierarchical, echo=FALSE}
+data.frame(monitor_hierarchical)[c("Bulk_ESS","Tail_ESS")]
+```
+#### f. Posterior Predictive Checking
+```{r results_hierarchical, echo=FALSE}
+
+football_data = extract(fit_foot)
+footballpredict_hir <- function(x, y) {
+set.seed(915706074)
+nsim <- 10000
+homeGoalsSim <- rpois(nsim, football_data$lambda[,x]) 
+awayGoalsSim <- rpois(nsim, football_data$lambda[,y])
+goalDiffSim <- homeGoalsSim - awayGoalsSim 
+win = sum(goalDiffSim > 0) / nsim
+draw = sum(goalDiffSim == 0) / nsim 
+loss = sum(goalDiffSim < 0) / nsim 
+results = data.frame(Home= teams_[x], Away= teams_[y], Win = win, Draw = draw, Loss = loss)
+return(results)
+}
+
+p = apply(football,1, function(row){data.frame(footballpredict_hir(match(row['HomeTeam'], teams_), match(row['AwayTeam'], teams_)))})
+p <- do.call(rbind,p)
+p
+p[-c(0,380)]
+
+```
+
+
+
+```{r loo_hierarchical}
+loo_hier <- loo(fit_foot)
+print(loo_hier)
+```
+```{r plot_loo_hierarchical}
+
+plot(loo_hier, label_points = TRUE)
+```
+
+### iii) Comparison of the models
+
+We have seen already the values of the PSIS-LOO for the hierachical model.
+Let's see now how are the results for the non-hierarchical one:
+
+```{r loo_non_hierarchical}
+loo_non_hier <- loo(stan_glm1)
+print(loo_non_hier)
+```
+```{r plot_loo_non_hierarchical}
+
+plot(loo_non_hier, label_points = TRUE)
+```
+
+From the PSIS-LOO results we conclude that the Loo values for both models are reliable as every point has a pareto k estimate  under 0.5. Apparently, for the hierarchical model this is even more reliable as there are less values over 0.4.
+
+With this in mind, we can safely compare both models:
+
+```{r loo_comapre}
+loo_comp <- loo_compare( loo_non_hier,loo_hier)
+print(loo_comp)
+```
+
+Se the first model is more accurate as has higher loo estimate, but the difference is not hugein comparison to both of estimates which are very low.
+This is expected doe to the variable nature of the football matches.
+
+
+## 4. Conclusion and discussion of potential improvements
+
+There are times when the betting odds cannot be that reliable, unless they count on extra information like knowledge from experts in the field. For example, when a team doesn't need a win but their contrary is playing for a title, or even worse, to reamin in the league. Then one team that might be favourite in normal conditions will have more chance to lose as it will try different players, give rest to others, etc.
+
+With this in mind we're happy with our predictions and we will compare both with the betting houses, to see how much they differ from the experts predictions.
+
+## 5. References
+
+
++ How to Use the rstanarm Package
+https://mc-stan.org/rstanarm/articles/rstanarm.html 
+
+Stan Reference Manual
++ 15.1 Hamiltonian Monte Carlo
+https://mc-stan.org/docs/2_21/reference-manual/hamiltonian-monte-carlo.html
+
+
++ Check HMC diagnostics after sampling
+https://mc-stan.org/rstan/reference/check_hmc_diagnostics.html
+
++ Predicting football results with Poisson regression pt. 2
+http://opisthokonta.net/?p=296
